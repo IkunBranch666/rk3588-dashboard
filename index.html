@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RK3588 工业仪表云端大屏</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body { margin: 0; padding: 20px; background-color: #121212; color: #ffffff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .header h1 { margin: 0; color: #00ffcc; letter-spacing: 2px; }
+        .header p { color: #888; font-size: 14px; margin-top: 5px; }
+        
+        .container { display: flex; gap: 20px; height: 75vh; }
+        
+        .left-panel { flex: 2; display: flex; flex-direction: column; gap: 20px; }
+        .card { background-color: #1e1e1e; border-radius: 10px; padding: 20px; border: 1px solid #333; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        
+        .data-display { text-align: center; flex: 1; display: flex; flex-direction: column; justify-content: center; }
+        .data-value { font-size: 80px; font-weight: bold; color: #00ff00; text-shadow: 0 0 20px rgba(0,255,0,0.5); transition: color 0.3s; margin: 10px 0; }
+        .data-value.danger { color: #ff3333; text-shadow: 0 0 20px rgba(255,51,51,0.5); }
+        
+        #chart { flex: 2; width: 100%; height: 100%; }
+        
+        .right-panel { flex: 1; display: flex; flex-direction: column; }
+        .log-list { list-style: none; padding: 0; margin: 0; overflow-y: auto; height: 100%; font-family: monospace; font-size: 14px; }
+        .log-item { padding: 10px; border-bottom: 1px solid #333; }
+        .log-time { color: #888; margin-right: 10px; }
+        .log-normal { border-left: 4px solid #00ff00; }
+        .log-danger { border-left: 4px solid #ff3333; background-color: rgba(255,51,51,0.1); color: #ff3333; font-weight: bold; }
+        
+        /* 状态指示灯 */
+        .status-dot { height: 15px; width: 15px; background-color: #ff3333; border-radius: 50%; display: inline-block; margin-right: 10px; vertical-align: middle; box-shadow: 0 0 10px #ff3333; }
+        .status-dot.connected { background-color: #00ff00; box-shadow: 0 0 10px #00ff00; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>工业边缘侧 VLM 视觉大模型云端协同控制台</h1>
+        <p><span id="connStatus" class="status-dot"></span> 云端通信总线：broker.emqx.io (WSS协议)</p>
+    </div>
+
+    <div class="container">
+        <div class="left-panel">
+            <div class="card data-display">
+                <h3 style="margin:0; color:#aaa;">实时仪表识别读数 (Device: <span id="devName">等待信号</span>)</h3>
+                <div id="bigNumber" class="data-value">0.00</div>
+                <div id="alertMsg" style="color: #ff3333; font-size: 20px; font-weight: bold; min-height: 25px;"></div>
+            </div>
+            <div class="card" style="flex: 2;">
+                <div id="chart"></div>
+            </div>
+        </div>
+
+        <div class="right-panel card">
+            <h3 style="margin-top:0; border-bottom: 1px solid #444; padding-bottom: 10px;">📡 边缘设备上报日志</h3>
+            <ul id="logList" class="log-list">
+                <li style="color:#666; text-align:center; padding: 20px;">等待 RK3588 边缘端启动推理...</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. 初始化 Echarts 折线图 ---
+        const chartDom = document.getElementById('chart');
+        const myChart = echarts.init(chartDom, 'dark');
+        const maxDataPoints = 30; // 图表最多显示 30 个点
+        let timeData = [];
+        let valueData = [];
+
+        const option = {
+            backgroundColor: 'transparent',
+            title: { text: '实时读数趋势', textStyle: { color: '#aaa', fontSize: 14 } },
+            tooltip: { trigger: 'axis' },
+            xAxis: { type: 'category', data: timeData, boundaryGap: false, splitLine: { show: false } },
+            yAxis: { type: 'value', min: 0, max: 12, splitLine: { lineStyle: { color: '#333' } } },
+            visualMap: {
+                top: 10, right: 10,
+                pieces: [{ gt: 0, lte: 8.0, color: '#00ff00' }, { gt: 8.0, color: '#ff3333' }], // 超过 8.0 变红
+                outOfRange: { color: '#999' }, show: false
+            },
+            series: [{
+                name: '表盘读数', type: 'line', data: valueData, smooth: true,
+                markLine: {
+                    silent: true, lineStyle: { color: '#ff3333', type: 'dashed' },
+                    data: [{ yAxis: 8.0, label: { formatter: '安全阈值 (8.0)' } }]
+                },
+                areaStyle: { opacity: 0.1 }
+            }]
+        };
+        myChart.setOption(option);
+
+        // --- 2. MQTT 连接与数据处理 ---
+        // 注意：Web 端必须使用 wss:// 协议和 8084 端口！
+        const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
+        const topic = 'rk3588/meter/data';
+        
+        console.log("正在连接云端 MQTT...");
+        const client = mqtt.connect(brokerUrl);
+
+        client.on('connect', () => {
+            console.log("MQTT 连接成功！");
+            document.getElementById('connStatus').classList.add('connected');
+            client.subscribe(topic);
+            document.getElementById('logList').innerHTML = ''; // 清空提示
+        });
+
+        client.on('message', (t, message) => {
+            try {
+                const payload = JSON.parse(message.toString());
+                const val = parseFloat(payload.value).toFixed(2);
+                const timeStr = payload.timestamp.split(' ')[1]; // 提取时分秒
+                const device = payload.device;
+                const isDanger = val > 8.0;
+
+                // 更新巨型数字
+                const bigNum = document.getElementById('bigNumber');
+                bigNum.innerText = val;
+                document.getElementById('devName').innerText = device;
+                
+                if (isDanger) {
+                    bigNum.classList.add('danger');
+                    document.getElementById('alertMsg').innerText = "⚠️ 警报：设备读数超限！";
+                } else {
+                    bigNum.classList.remove('danger');
+                    document.getElementById('alertMsg').innerText = "";
+                }
+
+                // 更新折线图
+                if (timeData.length >= maxDataPoints) { timeData.shift(); valueData.shift(); }
+                timeData.push(timeStr);
+                valueData.push(val);
+                myChart.setOption({ xAxis: { data: timeData }, series: [{ data: valueData }] });
+
+                // 更新右侧日志
+                const logList = document.getElementById('logList');
+                const logItem = document.createElement('li');
+                logItem.className = 'log-item ' + (isDanger ? 'log-danger' : 'log-normal');
+                logItem.innerHTML = `<span class="log-time">[${timeStr}]</span> 读数: <b>${val}</b>`;
+                logList.insertBefore(logItem, logList.firstChild); // 插入到最前面
+                
+                // 限制日志条数
+                if (logList.children.length > 50) logList.removeChild(logList.lastChild);
+
+            } catch (e) { console.error("解析 JSON 失败", e); }
+        });
+
+        // 窗口缩放自适应
+        window.addEventListener('resize', () => myChart.resize());
+    </script>
+</body>
+</html>
